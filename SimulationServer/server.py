@@ -11,6 +11,14 @@ import requests
 from datetime import datetime
 from rocketpy import Environment, Rocket, SolidMotor, Flight
 
+from ignition_fsm import (
+    Action,
+    IgnitionFSM,
+    EVENT_APOGEE,
+    EVENT_PYRO1,
+    EVENT_PYRO2,
+)
+
 # --- Load config -----------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", default="config.json", help="Path to config file")
@@ -41,6 +49,14 @@ GYRO_NOISE_STD        = math.radians(noise_cfg["gyro_std_deg"]) * math.sqrt(100)
 GPS_NOISE_STD_DEG     = noise_cfg["gps_std_meters"] / 111320
 
 MIN_PYRO_SEPARATION_S = val_cfg["min_pyro_separation_s"]
+
+# Ignition FSM defaults (overridable via the "validation" config section)
+MAX_EVENT_ALT_FACTOR          = 1.5  # events above 1.5x true apogee are impossible
+DEFAULT_DEDUP_WINDOW_S        = 0.5
+DEFAULT_DEDUP_ALT_TOLERANCE_M = 5.0
+
+if sim_cfg.get("seed") is not None:
+    random.seed(sim_cfg["seed"])
 
 
 # ---------------------------------------------------------------
@@ -236,6 +252,16 @@ def run_session(transport, flight, env):
     pyro2_state   = val_cfg["pyro2"]
     true_pyro2_alt = rocket_cfg["parachute"]["trigger"]
 
+    fsm = IgnitionFSM(
+        max_alt_m=(flight.apogee - env.elevation) * MAX_EVENT_ALT_FACTOR,
+        dedup_window_s=val_cfg.get("dedup_window_s", DEFAULT_DEDUP_WINDOW_S),
+        dedup_alt_tolerance_m=val_cfg.get(
+            "dedup_alt_tolerance_m", DEFAULT_DEDUP_ALT_TOLERANCE_M
+        ),
+        min_pyro_separation_s=MIN_PYRO_SEPARATION_S,
+        pyro2_enabled=pyro2_state,
+    )
+
     apogee_events = []
     pyro1_events  = []
     pyro2_events  = []
@@ -245,6 +271,8 @@ def run_session(transport, flight, env):
         "mode":         transport.mode,
         "packets_sent": 0,
         "events":       [],
+        "anomalies":    [],
+        "degraded":     False,
         "completed":    False,
     }
 
@@ -282,23 +310,26 @@ def run_session(transport, flight, env):
 
         line = transport.readline()
         if line:
-            parts = [p.strip() for p in line.split(",")]
-            if parts[0] == "EVENT" and len(parts) >= 3:
-                try:
-                    event_alt = float(parts[2])
-                    event = {"type": parts[1], "sim_time": round(t, 3), "alt": event_alt}
-                    session["events"].append(event)
-                    if parts[1] == "APOGEE":
-                        apogee_events.append((t, event_alt))
-                        print(f"[SIM] APOGEE at T+{t:.2f}s, alt={event_alt:.2f}m")
-                    elif parts[1] == "PYRO1":
-                        pyro1_events.append((t, event_alt))
-                        print(f"[SIM] PYRO1 FIRE at T+{t:.2f}s, alt={event_alt:.2f}m")
-                    elif parts[1] == "PYRO2":
-                        pyro2_events.append((t, event_alt))
-                        print(f"[SIM] PYRO2 FIRE at T+{t:.2f}s, alt={event_alt:.2f}m")
-                except ValueError:
-                    pass
+            decision = fsm.handle_line(line, t)
+            if decision is None:
+                pass
+            elif decision.action is Action.ACCEPT:
+                event = {"type": decision.event_type, "sim_time": round(t, 3), "alt": decision.alt}
+                session["events"].append(event)
+                if decision.event_type == EVENT_APOGEE:
+                    apogee_events.append((t, decision.alt))
+                    print(f"[SIM] APOGEE at T+{t:.2f}s, alt={decision.alt:.2f}m")
+                elif decision.event_type == EVENT_PYRO1:
+                    pyro1_events.append((t, decision.alt))
+                    print(f"[SIM] PYRO1 FIRE at T+{t:.2f}s, alt={decision.alt:.2f}m")
+                elif decision.event_type == EVENT_PYRO2:
+                    pyro2_events.append((t, decision.alt))
+                    print(f"[SIM] PYRO2 FIRE at T+{t:.2f}s, alt={decision.alt:.2f}m")
+            elif decision.action is Action.DUPLICATE:
+                print(f"[SIM] duplicate {decision.event_type} ignored — {decision.reason}")
+            else:
+                print(f"[SIM] {decision.action.value.upper()} "
+                      f"{decision.event_type or 'EVENT'} — {decision.reason}")
 
         if REALTIME:
             time.sleep(DT)
@@ -360,9 +391,11 @@ def run_session(transport, flight, env):
     for name, events in [("PYRO1", pyro1_events), ("PYRO2", pyro2_events)]:
         if not pyro2_state and name == "PYRO2":
             continue
-        if len(events) > 1:
-            times = ", ".join(f"T+{e[0]:.2f}s" for e in events)
-            print(f"{name} single-fire check: FAIL — fired {len(events)} times at: {times}")
+        refires = [a for a in fsm.anomalies
+                   if a["kind"] == "double_fire" and a["type"] == name]
+        if refires:
+            times = ", ".join(f"T+{a['sim_time']:.2f}s" for a in refires)
+            print(f"{name} single-fire check: FAIL — refired {len(refires)} time(s) at: {times}")
         elif len(events) == 1:
             print(f"{name} single-fire check: PASS — fired once")
         else:
@@ -381,6 +414,18 @@ def run_session(transport, flight, env):
         else:
             print("PYRO1 -> PYRO2 order:   SKIPPED (one or both channels never fired)")
             print("PYRO1/PYRO2 separation: SKIPPED (one or both channels never fired)")
+
+    # --- Degraded-mode summary ----------------------------------------------
+    session["degraded"]  = fsm.degraded
+    session["anomalies"] = fsm.anomalies
+    if fsm.anomalies:
+        print("\n=== IGNITION FSM ANOMALIES ===")
+        if fsm.degraded:
+            print("DEGRADED — first committed values stand; see anomalies below.")
+        for a in fsm.anomalies:
+            label = a["type"] or "EVENT"
+            print(f"  T+{a['sim_time']:.2f}s [{a['action']}/{a['kind']}] "
+                  f"{label}: {a['reason']}")
 
     session["completed"] = True
     return session

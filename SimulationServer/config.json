@@ -75,7 +75,8 @@
     "sim": {
         "dt": 0.01,
         "socket_host": "localhost",
-        "socket_port": 9000
+        "socket_port": 9000,
+        "seed": null
     },
 
     "validation": {
@@ -83,6 +84,8 @@
         "pyro1_time_tolerance_s": 1.0,
         "pyro2_alt_tolerance_m": 10.0,
         "min_pyro_separation_s": 2.0,
+        "dedup_window_s": 0.5,
+        "dedup_alt_tolerance_m": 5.0,
         "pyro1": true,
         "pyro2": true
     },
