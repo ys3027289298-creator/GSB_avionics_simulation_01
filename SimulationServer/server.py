@@ -11,9 +11,20 @@ import requests
 from datetime import datetime
 from rocketpy import Environment, Rocket, SolidMotor, Flight
 
+from ignition_fsm import (
+    IgnitionStateMachine,
+    ACCEPTED,
+    DUPLICATE,
+    REJECTED,
+    RETRY,
+)
+
 # --- Load config -----------------------------------------------------------
 parser = argparse.ArgumentParser()
 parser.add_argument("--config", default="config.json", help="Path to config file")
+parser.add_argument("--seed", type=int, default=None,
+                    help="RNG seed for reproducible sensor noise "
+                         "(overrides sim.seed in the config)")
 args = parser.parse_args()
 
 with open(args.config) as f:
@@ -26,6 +37,12 @@ flight_cfg = cfg["flight"]
 noise_cfg  = cfg["sensor_noise"]
 sim_cfg    = cfg["sim"]
 val_cfg    = cfg["validation"]
+
+# Deterministic noise: the same seed reproduces the exact same telemetry
+# stream, so identical event sequences always yield identical results.
+RNG_SEED = args.seed if args.seed is not None else sim_cfg.get("seed")
+if RNG_SEED is not None:
+    random.seed(RNG_SEED)
 
 # --- Derived constants -----------------------------------------------------
 BAUD_RATE             = 115200
@@ -236,15 +253,26 @@ def run_session(transport, flight, env):
     pyro2_state   = val_cfg["pyro2"]
     true_pyro2_alt = rocket_cfg["parachute"]["trigger"]
 
-    apogee_events = []
-    pyro1_events  = []
-    pyro2_events  = []
+    # Idempotent ignition state machine — see ignition_fsm.py and
+    # ANOMALY_POLICY.md for the reject / retry / degrade rules.
+    fsm = IgnitionStateMachine(
+        min_pyro_separation_s=MIN_PYRO_SEPARATION_S,
+        max_altitude_m=(flight.apogee - env.elevation) * 1.5,
+        min_altitude_m=0.0,
+        jitter_threshold_m=val_cfg.get("jitter_threshold_m", 25.0),
+        max_consecutive_parse_errors=val_cfg.get("max_consecutive_parse_errors", 5),
+        enable_pyro2=pyro2_state,
+    )
 
     session = {
         "timestamp":    datetime.utcnow().isoformat(),
         "mode":         transport.mode,
+        "seed":         RNG_SEED,
         "packets_sent": 0,
         "events":       [],
+        "anomalies":    [],
+        "degraded":     False,
+        "fsm_state":    "IDLE",
         "completed":    False,
     }
 
@@ -282,35 +310,35 @@ def run_session(transport, flight, env):
 
         line = transport.readline()
         if line:
-            parts = [p.strip() for p in line.split(",")]
-            if parts[0] == "EVENT" and len(parts) >= 3:
-                try:
-                    event_alt = float(parts[2])
-                    event = {"type": parts[1], "sim_time": round(t, 3), "alt": event_alt}
-                    session["events"].append(event)
-                    if parts[1] == "APOGEE":
-                        apogee_events.append((t, event_alt))
-                        print(f"[SIM] APOGEE at T+{t:.2f}s, alt={event_alt:.2f}m")
-                    elif parts[1] == "PYRO1":
-                        pyro1_events.append((t, event_alt))
-                        print(f"[SIM] PYRO1 FIRE at T+{t:.2f}s, alt={event_alt:.2f}m")
-                    elif parts[1] == "PYRO2":
-                        pyro2_events.append((t, event_alt))
-                        print(f"[SIM] PYRO2 FIRE at T+{t:.2f}s, alt={event_alt:.2f}m")
-                except ValueError:
-                    pass
+            outcome, payload = fsm.process_line(line, t)
+            if outcome == ACCEPTED:
+                event = payload
+                session["events"].append(event)
+                if event["type"] == "APOGEE":
+                    print(f"[SIM] APOGEE at T+{t:.2f}s, alt={event['alt']:.2f}m")
+                elif event["type"] == "PYRO1":
+                    print(f"[SIM] PYRO1 FIRE at T+{t:.2f}s, alt={event['alt']:.2f}m")
+                elif event["type"] == "PYRO2":
+                    print(f"[SIM] PYRO2 FIRE at T+{t:.2f}s, alt={event['alt']:.2f}m")
+            elif outcome in (DUPLICATE, REJECTED, RETRY):
+                session["anomalies"].append(payload)
+                print(f"[SIM] Anomaly ({outcome}): {payload['reason']} "
+                      f"[type={payload.get('type')}] at T+{t:.2f}s")
 
         if REALTIME:
             time.sleep(DT)
         t += DT
 
-    # --- Resolve detected values from event lists ---------------------------
-    detected_apogee_time = apogee_events[0][0] if apogee_events else None
-    detected_apogee_alt  = apogee_events[0][1] if apogee_events else None
-    detected_pyro1_time  = pyro1_events[0][0]  if pyro1_events  else None
-    detected_pyro1_alt   = pyro1_events[0][1]  if pyro1_events  else None
-    detected_pyro2_time  = pyro2_events[0][0]  if pyro2_events  else None
-    detected_pyro2_alt   = pyro2_events[0][1]  if pyro2_events  else None
+    # --- Resolve detected values from the state machine (single fires) ------
+    apogee_event = fsm.first("APOGEE")
+    pyro1_event  = fsm.first("PYRO1")
+    pyro2_event  = fsm.first("PYRO2")
+    detected_apogee_time = apogee_event["sim_time"] if apogee_event else None
+    detected_apogee_alt  = apogee_event["alt"]      if apogee_event else None
+    detected_pyro1_time  = pyro1_event["sim_time"]  if pyro1_event  else None
+    detected_pyro1_alt   = pyro1_event["alt"]       if pyro1_event  else None
+    detected_pyro2_time  = pyro2_event["sim_time"]  if pyro2_event  else None
+    detected_pyro2_alt   = pyro2_event["alt"]       if pyro2_event  else None
 
     true_apogee_time = flight.apogee_time
     true_apogee_alt  = flight.apogee - env.elevation
@@ -357,14 +385,21 @@ def run_session(transport, flight, env):
     # --- Sequence validation ------------------------------------------------
     print("\n=== SEQUENCE VALIDATION ===")
 
-    for name, events in [("PYRO1", pyro1_events), ("PYRO2", pyro2_events)]:
+    # The state machine enforces single-fire by construction (idempotency);
+    # duplicate attempts are counted here for the report.
+    duplicate_counts = {name: 0 for name in ("PYRO1", "PYRO2")}
+    for anomaly in fsm.anomalies:
+        if anomaly["kind"] == DUPLICATE and anomaly["type"] in duplicate_counts:
+            duplicate_counts[anomaly["type"]] += 1
+
+    for name in ("PYRO1", "PYRO2"):
         if not pyro2_state and name == "PYRO2":
             continue
-        if len(events) > 1:
-            times = ", ".join(f"T+{e[0]:.2f}s" for e in events)
-            print(f"{name} single-fire check: FAIL — fired {len(events)} times at: {times}")
-        elif len(events) == 1:
-            print(f"{name} single-fire check: PASS — fired once")
+        fired = fsm.first(name)
+        dupes = duplicate_counts[name]
+        if fired is not None:
+            suffix = f" ({dupes} duplicate attempt(s) ignored)" if dupes else ""
+            print(f"{name} single-fire check: PASS — fired once{suffix}")
         else:
             print(f"{name} single-fire check: FAIL — never fired")
 
@@ -382,6 +417,20 @@ def run_session(transport, flight, env):
             print("PYRO1 -> PYRO2 order:   SKIPPED (one or both channels never fired)")
             print("PYRO1/PYRO2 separation: SKIPPED (one or both channels never fired)")
 
+    # --- Anomaly / degradation summary --------------------------------------
+    counts = fsm.counts
+    print("\n=== ANOMALY SUMMARY ===")
+    print(f"Accepted: {counts[ACCEPTED]}  Duplicates (idempotent): {counts[DUPLICATE]}  "
+          f"Rejected: {counts[REJECTED]}  Retries: {counts[RETRY]}")
+    if fsm.degraded:
+        print("DEGRADED mode entered:")
+        for reason in fsm.degraded_reasons:
+            print(f"  - {reason}")
+    else:
+        print("Degraded mode: not entered")
+
+    session["degraded"]  = fsm.degraded
+    session["fsm_state"] = fsm.state
     session["completed"] = True
     return session
 
